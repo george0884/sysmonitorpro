@@ -132,6 +132,8 @@ def humanize(n: float, suffix="") -> str:
         n /= 1024.0
     return f"{n:.1f}P{suffix}"
 
+N_PROCS = 20        # procesos que se piden; se muestran los que entren en pantalla
+
 def sep(cols: int) -> str:
     return f"{D}{'─' * min(cols, 65)}{NC}"
 
@@ -1182,132 +1184,276 @@ def recolectar(info: dict, cfg: dict, gpus: list, fps=None, n_procs: int = 10) -
     return datos
 
 # ─── RENDER ─────────────────────────────────────────────────────────────────
-def render(datos: dict, cols: int, intervalo: float):
-    out = ["\033[H"]
-    sysd, cpu = datos["system"], datos["cpu"]
+# La pantalla se compone por secciones que se acomodan al tamaño de la
+# terminal: si sobra ancho se reparten en columnas, si falta alto se compactan
+# (núcleos en cuadrícula, menos detalle, sin separadores) y ninguna línea pasa
+# del ancho disponible, así nada se parte ni se sale de la pantalla.
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+COL_MIN = 62        # ancho mínimo de una columna
+COL_MAX = 90        # más allá de esto una columna sólo agrega espacio vacío
+HUECO = "   "       # separación entre columnas
+NIVELES = 4         # 0 = normal … 3 = lo más compacto
 
-    load_s = "  ".join(f"{x:.2f}" for x in sysd["load"]) if sysd["load"] else "N/A"
-    out.append(f" {M}▶ SISTEMA{NC}\033[K")
-    out.append(f"  {C}Host:{NC} {sysd['hostname']:<25} {C}Kernel:{NC} {sysd['kernel']}\033[K")
-    out.append(f"  {C}OS:{NC} {sysd['os']:<35}\033[K")
-    out.append(f"  {C}MB:{NC} {sysd['mb'][:45]}\033[K")
-    out.append(f"  {C}Uptime:{NC} {uptime_str(sysd['uptime']):<20} {C}Load:{NC} {load_s}\033[K")
-    out.append(sep(cols))
+def ancho_visible(s: str) -> int:
+    return len(ANSI_RE.sub("", s))
 
-    # CPU
+def recortar(s: str, ancho: int) -> str:
+    if ancho_visible(s) <= ancho:
+        return s
+    out, n, i = [], 0, 0
+    while i < len(s):
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        if n >= ancho:
+            break
+        out.append(s[i])
+        n += 1
+        i += 1
+    return "".join(out) + NC
+
+def ajustar(s: str, ancho: int) -> str:
+    s = recortar(s, ancho)
+    return s + " " * (ancho - ancho_visible(s))
+
+def cuadricula(celdas: list, ancho: int, sangria: str = "  ", hueco: int = 3) -> list:
+    if not celdas:
+        return []
+    w = max(ancho_visible(c) for c in celdas)
+    por_fila = max(1, (ancho - len(sangria) + hueco) // (w + hueco))
+    filas = []
+    for i in range(0, len(celdas), por_fila):
+        grupo = celdas[i:i + por_fila]
+        filas.append(sangria + (" " * hueco).join(ajustar(c, w) for c in grupo))
+    return filas
+
+def sec_sistema(datos, nivel, ancho):
+    s = datos["system"]
+    load_s = "  ".join(f"{x:.2f}" for x in s["load"]) if s["load"] else "N/A"
+    uptime = f"  {C}Uptime:{NC} {uptime_str(s['uptime']):<20} {C}Load:{NC} {load_s}"
+    if nivel >= 2:
+        return [f" {M}▶ SISTEMA{NC}  {D}{s['hostname']} · {s['os']}{NC}", uptime]
+    return [
+        f" {M}▶ SISTEMA{NC}",
+        f"  {C}Host:{NC} {s['hostname']:<25} {C}Kernel:{NC} {s['kernel']}",
+        f"  {C}OS:{NC} {s['os']}",
+        f"  {C}MB:{NC} {s['mb']}",
+        uptime,
+    ]
+
+def sec_cpu(datos, nivel, ancho):
+    cpu = datos["cpu"]
     freq = f"  {D}{cpu['freq_mhz'] / 1000:.2f} GHz{NC}" if cpu["freq_mhz"] else ""
-    out.append(f" {M}▶ CPU{NC}  {D}{cpu['model'][:50]}{NC}{freq}\033[K")
-    out.append(f"  {C}{'Total':<8}{NC} {barra(cpu['percent'])}{fmt_temp(cpu['temp'])}\033[K")
-    for i, pct in enumerate(cpu["per_core"][:12]):
-        t = cpu["temps_core"][i] if i < len(cpu["temps_core"]) else None
-        out.append(f"  {C}CPU {i + 1:<4}{NC} {barra(pct)}{fmt_temp(t)}\033[K")
-    if len(cpu["per_core"]) > 12:
-        out.append(f"  {D}... y {len(cpu['per_core']) - 12} cores mas{NC}\033[K")
-    if cpu["temp"] is None:
-        ayuda = "instala/abre LibreHardwareMonitor" if IS_WINDOWS else "ejecuta: sudo sensors-detect"
-        out.append(f"  {D}Temperatura no disponible ({ayuda}){NC}\033[K")
-    out.append(sep(cols))
-
-    # GPU
-    if "gpu" in datos:
-        if not datos["gpu"]:
-            out.append(f" {M}▶ GPU{NC}  {D}No detectada{NC}\033[K")
-        for g in datos["gpu"][:3]:
-            out.append(f" {M}▶ GPU{NC}  {D}{g['name'][:45]}{NC}\033[K")
-            if g["usage"] is not None:
-                linea = barra(g["usage"])
-            elif g["freq"]:
-                cur, mx = g["freq"]
-                linea = f"{barra(cur * 100 / mx)}  {D}{cur}/{mx} MHz{NC}"
-            else:
-                linea = barra_na()
-            out.append(f"  {C}{'Uso':<8}{NC} {linea}{fmt_temp(g['temp'])}\033[K")
-            if g["vram_total"]:
-                pct = (g["vram_used"] or 0) * 100 / g["vram_total"]
-                out.append(f"  {C}{'VRAM':<8}{NC} {barra(pct)}  {C}{humanize(g['vram_used'])} / {humanize(g['vram_total'])}{NC}\033[K")
-        out.append(sep(cols))
-
-    # FPS
-    if "fps" in datos:
-        fp = datos["fps"]
-        if fp.get("app") and fp.get("fps") is not None:
-            col = R if fp["fps"] < 30 else (Y if fp["fps"] < 60 else G)
-            if fp.get("vivo"):
-                titulo = f"{D}{fp['app'][:35]}  ({fp['fuente']}){NC}"
-            else:
-                mins = int((fp.get("hace") or 0) // 60)
-                titulo = f"{D}última partida: {fp['app'][:28]} · hace {mins} min{NC}"
-            out.append(f" {M}▶ FPS{NC}  {titulo}\033[K")
-            etiqueta = "FPS" if fp.get("vivo") else "Prom."
-            low = f"{fp['low1']:.0f}" if fp.get("low1") else "N/A"
-            ft = f"{fp['frametime']:.1f} ms" if fp.get("frametime") else "N/A"
-            out.append(f"  {C}{etiqueta:<8}{NC} {col}\033[1m{fp['fps']:>5.0f}{NC}"
-                       f"   {C}1% low{NC} {low:>5}   {C}Frametime{NC} {ft}\033[K")
-        elif fp.get("app"):
-            out.append(f" {M}▶ FPS{NC}  {D}{fp['app'][:35]}  (esperando datos){NC}\033[K")
-        else:
-            motivo = fp.get("error") or f"esperando un juego ({fp['fuente']})"
-            out.append(f" {M}▶ FPS{NC}  {D}{motivo[:58]}{NC}\033[K")
-        out.append(sep(cols))
-
-    # RECURSOS
-    mem = datos["memory"]
-    out.append(f" {M}▶ RECURSOS{NC}\033[K")
-    ram = mem["ram"]
-    out.append(f"  {C}{'RAM':<8}{NC} {barra(ram['percent'])}  {C}{humanize(ram['used'])} / {humanize(ram['total'])}{NC}\033[K")
-    sw = mem["swap"]
-    if sw["total"]:
-        out.append(f"  {C}{sw['name']:<8}{NC} {barra(sw['percent'])}  {C}{humanize(sw['used'])} / {humanize(sw['total'])}{NC}\033[K")
+    out = [f" {M}▶ CPU{NC}  {D}{cpu['model']}{NC}{freq}",
+           f"  {C}{'Total':<8}{NC} {barra(cpu['percent'])}{fmt_temp(cpu['temp'])}"]
+    temps = cpu["temps_core"]
+    nucleos = cpu["per_core"]
+    if nivel == 0 and len(nucleos) <= 16:
+        for i, pct in enumerate(nucleos):
+            t = temps[i] if i < len(temps) else None
+            out.append(f"  {C}CPU {i + 1:<4}{NC} {barra(pct)}{fmt_temp(t)}")
     else:
-        out.append(f"  {C}{sw['name']:<8}{NC} {D}desactivada{NC}\033[K")
-    out.append(sep(cols))
+        # Cuadrícula: varios núcleos por fila con barras más cortas
+        largo = 8 if nivel < 3 else 6
+        celdas = []
+        for i, pct in enumerate(nucleos):
+            t = temps[i] if i < len(temps) else None
+            temp = f" {color_temp(t)}{t:3.0f}°{NC}" if t is not None else ""
+            celdas.append(f"{C}{i + 1:>2}{NC} {barra(pct, largo)}{temp}")
+        out += cuadricula(celdas, ancho)
+    if cpu["temp"] is None and nivel < 2:
+        ayuda = "instala/abre LibreHardwareMonitor" if IS_WINDOWS else "ejecuta: sudo sensors-detect"
+        out.append(f"  {D}Temperatura no disponible ({ayuda}){NC}")
+    return out
 
-    # RED
-    if "network" in datos:
-        n = datos["network"]
-        out.append(f" {M}▶ RED{NC}  {D}{n['iface']}{NC}\033[K")
-        out.append(f"  {C}IP:{NC} {n['ip']:<18} {C}↓ {humanize(n['rx_s'])}/s{NC}  {C}↑ {humanize(n['tx_s'])}/s{NC}\033[K")
-        out.append(f"  {C}Total:{NC} ↓ {humanize(n['rx_total'])}  ↑ {humanize(n['tx_total'])}\033[K")
-        out.append(sep(cols))
+def sec_gpu(datos, nivel, ancho):
+    if not datos["gpu"]:
+        return [f" {M}▶ GPU{NC}  {D}No detectada{NC}"]
+    out = []
+    for g in datos["gpu"][:3]:
+        out.append(f" {M}▶ GPU{NC}  {D}{g['name']}{NC}")
+        if g["usage"] is not None:
+            linea = barra(g["usage"])
+        elif g["freq"]:
+            cur, mx = g["freq"]
+            linea = f"{barra(cur * 100 / mx)}  {D}{cur}/{mx} MHz{NC}"
+        else:
+            linea = barra_na()
+        out.append(f"  {C}{'Uso':<8}{NC} {linea}{fmt_temp(g['temp'])}")
+        if g["vram_total"]:
+            pct = (g["vram_used"] or 0) * 100 / g["vram_total"]
+            out.append(f"  {C}{'VRAM':<8}{NC} {barra(pct)}  {C}{humanize(g['vram_used'])} / {humanize(g['vram_total'])}{NC}")
+    return out
 
-    # DISCOS FÍSICOS
-    if "disks" in datos:
-        out.append(f" {M}▶ DISCOS FÍSICOS{NC}\033[K")
-        for d in datos["disks"]:
-            tipo = f"{D}{d['tipo']:<4}{NC} " if d["tipo"] else ""
-            if d["percent"] is not None:
-                uso = f"{barra(d['percent'])}  {C}{humanize(d['used'])} / {humanize(d['total'])}{NC}"
-            else:
-                uso = f"{D}[{'·' * 12}] sin montar{NC}"
-            out.append(f"  {tipo}{C}{d['model'][:20]:<20}{NC} {uso}  {D}({humanize(d['size'])}){NC}\033[K")
-            if d["read_s"] is not None or d["temp"] is not None:
-                io = (f"R {humanize(d['read_s'])}/s  W {humanize(d['write_s'])}/s"
-                      if d["read_s"] is not None else "")
-                out.append(f"       {D}{d['dev']:<16}{NC} {C}{io}{NC}{fmt_temp(d['temp'])}\033[K")
-        if not datos["disks"]:
-            out.append(f"  {D}No se detectaron discos{NC}\033[K")
-        out.append(sep(cols))
+def sec_fps(datos, nivel, ancho):
+    fp = datos["fps"]
+    if fp.get("app") and fp.get("fps") is not None:
+        col = R if fp["fps"] < 30 else (Y if fp["fps"] < 60 else G)
+        if fp.get("vivo"):
+            titulo = f"{D}{fp['app'][:35]}  ({fp['fuente']}){NC}"
+        else:
+            mins = int((fp.get("hace") or 0) // 60)
+            titulo = f"{D}última partida: {fp['app'][:28]} · hace {mins} min{NC}"
+        etiqueta = "FPS" if fp.get("vivo") else "Prom."
+        low = f"{fp['low1']:.0f}" if fp.get("low1") else "N/A"
+        ft = f"{fp['frametime']:.1f} ms" if fp.get("frametime") else "N/A"
+        return [f" {M}▶ FPS{NC}  {titulo}",
+                f"  {C}{etiqueta:<8}{NC} {col}\033[1m{fp['fps']:>5.0f}{NC}"
+                f"   {C}1% low{NC} {low:>5}   {C}Frametime{NC} {ft}"]
+    if fp.get("app"):
+        return [f" {M}▶ FPS{NC}  {D}{fp['app'][:35]}  (esperando datos){NC}"]
+    motivo = fp.get("error") or f"esperando un juego ({fp['fuente']})"
+    return [f" {M}▶ FPS{NC}  {D}{motivo}{NC}"]
 
-    # PROCESOS
-    if "processes" in datos:
-        out.append(f" {M}▶ TOP PROCESOS{NC}  {D}(cpu%){NC}\033[K")
-        out.append(f"  {C}{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'USER':<12}  {'NOMBRE'}{NC}\033[K")
-        disponibles = shutil.get_terminal_size().lines - len(out) - 3
-        for proc in datos["processes"][:max(3, min(disponibles, 10))]:
-            cpu_p = proc.get("cpu_percent") or 0.0
-            mem_p = proc.get("memory_percent") or 0.0
-            user = proc["username"][:12]
-            name = (proc.get("name") or "?")[:30]
-            cpu_col = G if cpu_p < 50 else (Y if cpu_p < 80 else R)
-            out.append(
-                f"  {D}{proc['pid']:>7}{NC}  {cpu_col}{cpu_p:>5.1f}{NC}  "
-                f"{C}{mem_p:>5.1f}{NC}  {W}{user:<12}{NC}  {name}\033[K"
-            )
+def sec_recursos(datos, nivel, ancho):
+    mem = datos["memory"]
+    ram, sw = mem["ram"], mem["swap"]
+    out = [f" {M}▶ RECURSOS{NC}",
+           f"  {C}{'RAM':<8}{NC} {barra(ram['percent'])}  {C}{humanize(ram['used'])} / {humanize(ram['total'])}{NC}"]
+    if sw["total"]:
+        out.append(f"  {C}{sw['name']:<8}{NC} {barra(sw['percent'])}  {C}{humanize(sw['used'])} / {humanize(sw['total'])}{NC}")
+    else:
+        out.append(f"  {C}{sw['name']:<8}{NC} {D}desactivada{NC}")
+    return out
 
-    out.append(f"\n  {W}q{NC} salir  {D}· refresco {intervalo:g}s{NC}\033[K")
-    out.append("\033[J")
+def sec_red(datos, nivel, ancho):
+    n = datos["network"]
+    out = [f" {M}▶ RED{NC}  {D}{n['iface']}{NC}",
+           f"  {C}IP:{NC} {n['ip']:<18} {C}↓ {humanize(n['rx_s'])}/s{NC}  {C}↑ {humanize(n['tx_s'])}/s{NC}"]
+    if nivel < 2:
+        out.append(f"  {C}Total:{NC} ↓ {humanize(n['rx_total'])}  ↑ {humanize(n['tx_total'])}")
+    return out
 
-    sys.stdout.write("\n".join(out))
+def sec_discos(datos, nivel, ancho):
+    out = [f" {M}▶ DISCOS FÍSICOS{NC}"]
+    # En columnas angostas se acorta el modelo y se omite el tamaño total
+    holgado = ancho >= 78
+    lm = 20 if holgado else max(10, min(20, ancho - 50))
+    for d in datos["disks"]:
+        tipo = f"{D}{d['tipo']:<4}{NC} " if d["tipo"] else ""
+        if d["percent"] is not None:
+            uso = f"{barra(d['percent'])}  {C}{humanize(d['used'])} / {humanize(d['total'])}{NC}"
+        else:
+            uso = f"{D}[{'·' * 12}] sin montar{NC}"
+        tam = f"  {D}({humanize(d['size'])}){NC}" if holgado else ""
+        out.append(f"  {tipo}{C}{d['model'][:lm]:<{lm}}{NC} {uso}{tam}")
+        if nivel < 2 and (d["read_s"] is not None or d["temp"] is not None):
+            io = (f"R {humanize(d['read_s'])}/s  W {humanize(d['write_s'])}/s"
+                  if d["read_s"] is not None else "")
+            out.append(f"       {D}{d['dev']:<16}{NC} {C}{io}{NC}{fmt_temp(d['temp'])}")
+    if not datos["disks"]:
+        out.append(f"  {D}No se detectaron discos{NC}")
+    return out
+
+def sec_procesos(datos, n, ancho):
+    out = [f" {M}▶ TOP PROCESOS{NC}  {D}(cpu%){NC}",
+           f"  {C}{'PID':>7}  {'CPU%':>5}  {'MEM%':>5}  {'USER':<12}  {'NOMBRE'}{NC}"]
+    largo_nombre = max(10, ancho - 41)
+    for proc in datos["processes"][:n]:
+        cpu_p = proc.get("cpu_percent") or 0.0
+        mem_p = proc.get("memory_percent") or 0.0
+        user = proc["username"][:12]
+        name = (proc.get("name") or "?")[:largo_nombre]
+        cpu_col = G if cpu_p < 50 else (Y if cpu_p < 80 else R)
+        out.append(f"  {D}{proc['pid']:>7}{NC}  {cpu_col}{cpu_p:>5.1f}{NC}  "
+                   f"{C}{mem_p:>5.1f}{NC}  {W}{user:<12}{NC}  {name}")
+    return out
+
+PROCS_MIN = 3
+
+def distribuir(alturas: list, k: int, con_sep: bool):
+    """Reparte las secciones (en orden) en k columnas minimizando la más alta."""
+    from itertools import combinations
+    n = len(alturas)
+    k = max(1, min(k, n))
+    extra = 1 if con_sep else 0
+
+    def alto(a, b):
+        return sum(alturas[a:b]) + extra * max(0, b - a - 1)
+
+    mejor = None
+    for cortes in combinations(range(1, n), k - 1):
+        lim = (0,) + cortes + (n,)
+        grupos = [(lim[i], lim[i + 1]) for i in range(k)]
+        m = max(alto(a, b) for a, b in grupos)
+        if mejor is None or m < mejor[0]:
+            mejor = (m, grupos)
+    return mejor
+
+def componer(datos: dict, cols: int, filas: int, intervalo: float) -> list:
+    pie = ["", f"  {W}q{NC} salir  {D}· refresco {intervalo:g}s{NC}"]
+    if filas < 12:
+        pie = []
+    util = max(1, filas - len(pie))
+    max_k = max(1, min(3, (cols + len(HUECO)) // (COL_MIN + len(HUECO))))
+    n_procs = len(datos.get("processes", []))
+
+    def construir(nivel, k):
+        ancho = cols if k == 1 else min(COL_MAX, (cols - len(HUECO) * (k - 1)) // k)
+        secciones = [sec_sistema(datos, nivel, ancho), sec_cpu(datos, nivel, ancho)]
+        if "gpu" in datos:
+            secciones.append(sec_gpu(datos, nivel, ancho))
+        if "fps" in datos:
+            secciones.append(sec_fps(datos, nivel, ancho))
+        secciones.append(sec_recursos(datos, nivel, ancho))
+        if "network" in datos:
+            secciones.append(sec_red(datos, nivel, ancho))
+        if "disks" in datos:
+            secciones.append(sec_discos(datos, nivel, ancho))
+        alturas = [len(s) for s in secciones]
+        if "processes" in datos:
+            secciones.append(None)              # se llena al final con lo que sobre
+            alturas.append(2 + min(PROCS_MIN, n_procs))
+        con_sep = nivel < NIVELES - 1
+        alto, grupos = distribuir(alturas, k, con_sep)
+        return ancho, secciones, alturas, grupos, con_sep, alto
+
+    # Primero lo menos compacto; dentro de cada nivel, la menor cantidad de
+    # columnas que entre a lo alto.
+    eleccion = None
+    for nivel in range(NIVELES):
+        for k in range(1, max_k + 1):
+            r = construir(nivel, k)
+            if r[-1] <= util:
+                eleccion = r
+                break
+        if eleccion:
+            break
+    if eleccion is None:
+        eleccion = construir(NIVELES - 1, max_k)
+    ancho, secciones, alturas, grupos, con_sep, _ = eleccion
+
+    columnas = []
+    for a, b in grupos:
+        col = []
+        for i in range(a, b):
+            if col and con_sep:
+                col.append(sep(ancho))
+            if secciones[i] is None:            # procesos: ocupan el alto restante
+                libre = util - len(col) - 2
+                if libre <= 0:
+                    if col and con_sep:
+                        col.pop()
+                    continue
+                secciones[i] = sec_procesos(datos, min(libre, n_procs), ancho)
+            col += secciones[i]
+        columnas.append(col)
+
+    lineas = []
+    for r in range(min(util, max(len(c) for c in columnas))):
+        partes = []
+        for j, col in enumerate(columnas):
+            celda = col[r] if r < len(col) else ""
+            ultima = j == len(columnas) - 1
+            partes.append(recortar(celda, ancho) if ultima else ajustar(celda, ancho))
+        lineas.append(HUECO.join(partes))
+    return [recortar(l, cols) for l in lineas] + pie
+
+def render(datos: dict, cols: int, filas: int, intervalo: float):
+    lineas = componer(datos, cols, filas, intervalo)
+    sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in lineas) + "\033[J")
     sys.stdout.flush()
 
 # ─── CONFIGURACIÓN / ARGUMENTOS ─────────────────────────────────────────────
@@ -1413,8 +1559,8 @@ def main():
                     resize_event.clear()
                     clear_screen()
                     first = False
-                cols = shutil.get_terminal_size().columns
-                render(recolectar(system_info, cfg, gpus, fps), cols, intervalo)
+                size = shutil.get_terminal_size()
+                render(recolectar(system_info, cfg, gpus, fps, N_PROCS), size.columns, size.lines, intervalo)
                 ready, _, _ = _sel.select([sys.stdin], [], [], intervalo)
                 if ready:
                     key = sys.stdin.read(1).lower()
@@ -1434,7 +1580,7 @@ def main():
                 if size != last_size:
                     clear_screen()
                     last_size = size
-                render(recolectar(system_info, cfg, gpus, fps), size.columns, intervalo)
+                render(recolectar(system_info, cfg, gpus, fps, N_PROCS), size.columns, size.lines, intervalo)
 
                 fin = time.monotonic() + intervalo
                 while time.monotonic() < fin:

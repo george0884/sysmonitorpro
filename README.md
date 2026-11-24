@@ -19,7 +19,7 @@
 | **FPS** | Juego activo, FPS, 1% low y frametime · Solo si ya tienes PresentMon (Windows, como administrador) o MangoHud (Linux); si no, la sección no aparece |
 | **GPU** | NVIDIA (nvidia-smi), AMD (sysfs: uso, VRAM, temp), Intel (frecuencia) · Windows: contadores nativos o LibreHardwareMonitor |
 | **Modo JSON** | Salida estructurada para scripts |
-| **UI** | Pantalla alternativa · Cursor oculto · Redimensionamiento dinámico |
+| **UI** | Pantalla alternativa · Cursor oculto · Diseño adaptable: con ventana ancha las secciones se reparten en 2–3 columnas; con ventana baja se compacta (núcleos en cuadrícula, menos detalle) para que todo entre sin cortarse |
 
 ## 🚀 Instalación rápida
 
